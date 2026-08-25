@@ -1,0 +1,90 @@
+name: generate-kernel
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+env:
+  REPO: opengamingcollective/kernel-packages-fedora
+  TAG: latest-fc44
+  PACKAGES: "kernel kernel-core kernel-devel kernel-devel-matched kernel-modules kernel-headers"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Extract RPM from OCI images
+        run: |
+          mkdir kernel-rpms
+          GHCR_TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:$REPO:pull" | jq -r .token)
+          MANIFEST=$(curl -s \
+            -H "Authorization: Bearer $GHCR_TOKEN" \
+            -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+            "https://ghcr.io/v2/$REPO/manifests/$TAG")
+          echo "$MANIFEST" | jq -c '.layers[]' | while read -r layer; do
+            DIGEST=$(echo "$layer" | jq -r '.digest')
+            TITLE=$(echo "$layer" | jq -r '.annotations["org.opencontainers.image.title"] // empty')
+            if [ -z "$TITLE" ]; then
+              continue
+            fi
+            for PKG in $PACKAGES; do
+              if [[ "$TITLE" =~ ^${PKG}-[0-9] ]]; then
+                curl -sL \
+                  -H "Authorization: Bearer $GHCR_TOKEN" \
+                  "https://ghcr.io/v2/$REPO/blobs/$DIGEST" \
+                  -o "kernel-rpms/$TITLE"
+                break
+              fi
+            done
+          done
+          ls -la kernel-rpms/
+          MISSING=0
+          for PKG in $PACKAGES; do
+            if ! ls kernel-rpms/ | grep -qE "^${PKG}-[0-9]"; then
+              echo "Missing package: $PKG"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" == "1" ]; then
+            exit 1
+          fi
+
+      - name: Version check
+        id: version
+        run: |
+          FILE=$(ls kernel-rpms/kernel-[0-9]*.rpm | head -n1)
+          VERSION=$(basename "$FILE" .rpm | sed 's/^kernel-//')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=kernel-$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes
+        run: |
+          cat <<EOF > release-notes.md
+
+          The Open Gaming Collective is a joint effort to share gaming-related improvements across the ecosystem instead of each project maintaining its own separate patches. OGC kernel is a shared, gaming-focused Linux kernel build. It is based on the Fedora kernel and includes additional optimizations for handheld and gaming hardware.
+
+          ## Packages
+
+          - **kernel**: meta-package, depends on kernel-core and kernel-modules
+          - **kernel-core**: the bootable kernel binary and essential modules
+          - **kernel-modules**: additional loadable kernel modules
+          - **kernel-devel**: headers and files needed to build external modules
+          - **kernel-devel-matched**: kernel-devel version matched to the running kernel
+          - **kernel-headers**: headers for building user-space programs
+          EOF
+
+      - name: Push release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Kernel ${{ steps.version.outputs.version }}"
+          body_path: release-notes.md
+          files: kernel-rpms/*.rpm
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
